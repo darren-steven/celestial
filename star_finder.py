@@ -17,24 +17,24 @@ import pandas as pd
 with load.open(hipparcos.URL) as f:
             df = hipparcos.load_dataframe(f)
 
-# Create a MultiIndex with the desired levels
-new_index = pd.MultiIndex.from_arrays(
-    [
-        df['ra_hours'],
-        df['dec_degrees'],
-        df['magnitude'],
-        df.index,  # HIP ID
-    ],
-    names=['ra_hours', 'dec_degrees', 'magnitude', 'hip']
-)
+# # Create a MultiIndex with the desired levels
+# new_index = pd.MultiIndex.from_arrays(
+#     [
+#         df['ra_hours'],
+#         df['dec_degrees'],
+#         df['magnitude'],
+#         df.index,  # HIP ID
+#     ],
+#     names=['ra_hours', 'dec_degrees', 'magnitude', 'hip']
+# )
 
-# Reindex the dataframe
-reindexed_df = df.set_index(new_index)
+# # Reindex the dataframe
+# reindexed_df = df.set_index(new_index)
 
-# Sort the index for efficient lookup
-reindexed_df = reindexed_df.sort_index()
+# # Sort the index for efficient lookup
+# reindexed_df = reindexed_df.sort_index()
 
-df = reindexed_df
+# df = reindexed_df
 
 planets = load('de421.bsp')
 earth = planets['earth']
@@ -101,7 +101,7 @@ def find_stars_at_altaz(df, latitude, longitude, time, target_azimuth, target_al
 
     return found_stars
 
-def find_stars_at_ra_dec(df, latitude, longitude, time, target_ra, target_dec, tolerance_degrees=3.0, tolerance_hours=1.0, magnitude=4.0):
+def find_stars_at_ra_dec(df, latitude, longitude, time, target_ra, target_dec, tolerance_degrees, tolerance_hours, magnitude):
     """
     Finds stars within a given tolerance of a target azimuth and altitude.
 
@@ -113,12 +113,13 @@ def find_stars_at_ra_dec(df, latitude, longitude, time, target_ra, target_dec, t
         target_ra (float): Target right ascention (hours)
         target_dec (float): Target declination (degrees)
         tolerance_degrees (float): Tolerance in degrees for matching azimuth and altitude.
-        tolerance_hours
+        tolerance_hours: Tolerance in hours for matching RA and Dec
         magnitude (float): Filter stars with a magnitude less than this value (big speedup)
 
     Returns:
         list: A list of dictionaries, each containing star information (name, HIP number, azimuth, altitude).
     """
+    print(f"Searching for stars within {tolerance_hours:2f} hours of RA {target_ra:2f} and {tolerance_degrees:2f} degrees of Dec {target_dec:2f}, magnitude {magnitude}")
     
     # filter on magnitude
     df = df.loc[(df['magnitude'] <= magnitude)]
@@ -134,11 +135,12 @@ def find_stars_at_ra_dec(df, latitude, longitude, time, target_ra, target_dec, t
     found_stars = []
 
     # Iterate through the stars in the catalog
+    # returns the index and row (hip_number is index value)
     for hip_number, row in df.iterrows():
         star = Star.from_dataframe(row)
         apparent = astrometric.observe(star).apparent()
-        ra, dec, distance = apparent.radec(time)
-        az, alt, distance = apparent.altaz()
+        ra, dec, _ = apparent.radec()
+        alt,az, _ = apparent.altaz()
 
 
         # TODO - check if star is withing our range of ra and dec (ra +- tolerance, dec +- tolerance)
@@ -147,8 +149,8 @@ def find_stars_at_ra_dec(df, latitude, longitude, time, target_ra, target_dec, t
                 abs(dec.degrees - target_dec) <= tolerance_degrees):
             found_stars.append({
                 'hip': hip_number,
-                'azimuth': np.rad2deg(az.radians),
-                'altitude': np.rad2deg(alt.radians),
+                'azimuth': az,
+                'altitude': alt,
                 'magnitude': row['magnitude'],
                 'ra': row['ra_hours'],
                 'dec': row['dec_degrees']
@@ -174,24 +176,11 @@ def altaz_to_radec(altitude_degrees, azimuth_degrees, latitude_degrees, longitud
             - dec_degrees: Declination in degrees.
     """
 
-    # Load the ephemeris (needed for accurate time calculations)
-    ts = load.timescale()
+    geographic = wgs84.latlon(latitude_degrees, longitude_degrees, elevation_meters)
+    observer = geographic.at(timestamp)
+    pos = observer.from_altaz(alt_degrees=altitude_degrees, az_degrees=azimuth_degrees)
 
-    # Create the observer's location (Topos object)
-    observer = Topos(latitude_degrees=latitude_degrees,
-                     longitude_degrees=longitude_degrees,
-                     elevation_m=elevation_meters)
-
-    # Create an AltAz position
-    alt = Angle(degrees=altitude_degrees)
-    az = Angle(degrees=azimuth_degrees)
-
-    # Create a dummy star at the alt/az position
-    # We are creating a star at the alt/az position, then finding the ra/dec of that star
-    apparent = observer.at(timestamp).from_altaz(alt_degrees=altitude_degrees, az_degrees=azimuth_degrees)
-
-    # Get the RA/Dec coordinates
-    ra, dec, distance = apparent.radec()
+    ra, dec, distance = pos.radec()
 
     return ra.hours, dec.degrees
 
@@ -236,50 +225,60 @@ def calculate_distance_and_altaz(lat1, lng1, elevation1, lat2, lng2, elevation2,
 
     return distance_km, azimuth_degrees, altitude_degrees
 
+def time_format(zone, observation_time):
+    return observation_time.astimezone(zone).strftime("%d %B %Y %I:%M%p")
+
 if __name__ == "__main__":
-     ts = load.timescale()
-zone = timezone('US/Mountain')
-now = dt.datetime(2025, 1, 27, 18, 00, 00, tzinfo=zone)
 
-time = ts.from_datetime(now)
-tolerance_degrees = 20.0
-magnitude = 3.0
+    ts = load.timescale()
+    zone = timezone('US/Mountain')
+    observation_time = dt.datetime(2025, 1, 30, 18, 29, 00, tzinfo=zone)
 
-# test our azimuth calc
-# Location 1: Heffron 38.97605656360721, -104.47841397017535 38°58'13.86" N 104°29'36.05" W
-lat1 = Angle(degrees = 38.97605656360721 )  # Degrees
-lng1 = Angle(degrees = -104.47841397017535) # Degrees
-elevation1 = 2027  # Meters
+    time = ts.from_datetime(observation_time)
+    # for a given alt/az, all the stars that pass through will be a fixed declination, with ra varying with time
+    # set tight dec tolerance, low RA
+    tolerance_dec = 10/60.0
+    tolerance_ra = 10/60.0
+    magnitude = 10.0
+
+    # te 39° 0'0.34"Nst our azimuth calc
+    # Location 1: Heffron 38.97605656360721, -104.47841397017535 38°58'13.86" N 104°29'36.05" W
+    #  39°00'04.93" N 104°30'10.23" W
+    lat1 = Angle(degrees = 39.0 + 0/60.0 + 4.93/3600.0 )  # Degrees
+    lng1 = Angle(degrees = -1.0*(104.0 + 30/60.0 + 10.23/3600.0)) # Degrees
+    elevation1 = 2073  # Meters
 
 
-# Location 2: Pikes peak 38.8409° N, 105.0423° W
-lat2 = Angle(degrees = 38.8409)
-lng2 = Angle(degrees = -105.0423) 
-elevation2 = 4345.7
+    # Location 2: Pikes peak 38.8409° N, 105.0423° W
+    lat2 = Angle(degrees = 38.8409)
+    lng2 = Angle(degrees = -105.0423) 
+    elevation2 = 4345.7
 
-# Calculate distance and alt/az
-distance_km, azimuth_degrees, altitude_degrees = calculate_distance_and_altaz(
-    lat1.degrees, lng1.degrees, elevation1, lat2.degrees, lng2.degrees, elevation2, time
-)
+    # Calculate distance and alt/az
+    distance_km, azimuth_degrees, altitude_degrees = calculate_distance_and_altaz(
+        lat1.degrees, lng1.degrees, elevation1, lat2.degrees, lng2.degrees, elevation2, time
+    )
 
-target_ra, target_dec = altaz_to_radec(azimuth_degrees, altitude_degrees,
-                                        lat2.degrees, lng2.degrees, elevation2, time)
+    target_ra, target_dec = altaz_to_radec(altitude_degrees, azimuth_degrees,
+                                            lat2.degrees, lng2.degrees, elevation2, time)
 
-print(f"At {time.utc_strftime('%Y-%m-%d %H:%M:%S UTC')}:")
-print(f"  Distance between locations: {distance_km:.2f} km")
-print(f"  Azimuth from location 1 to location 2: {azimuth_degrees:.2f}°")
-print(f"  Altitude from location 1 to location 2: {altitude_degrees:.2f}°")
-print(f"  Target RA: {target_ra}, Target Dec; {target_dec}")
+    print(f"At {time.utc_strftime('%Y-%m-%d %H:%M:%S UTC')}:")
+    print(f"  Distance between locations: {distance_km:.2f} km")
+    print(f"  Azimuth from location 1 to location 2: {azimuth_degrees:.2f}°")
+    print(f"  Altitude from location 1 to location 2: {altitude_degrees:.2f}°")
+    print(f"  Target RA of alt/az: {target_ra}, Target Dec; {target_dec}")
+    print(f"  Target lat/long: {lat2.degrees}, {lng2.degrees} at {elevation2}")
+    print()
 
-# found_stars = find_stars_at_altaz(df, latitude, longitude, time, target_azimuth, target_altitude, tolerance_degrees, magnitude)
-found_stars = find_stars_at_ra_dec(df, lat2.degrees, lng2.degrees, time,
-                                    target_ra, target_dec)
+    # found_stars = find_stars_at_altaz(df, latitude, longitude, time, target_azimuth, target_altitude, tolerance_degrees, magnitude)
+    found_stars = find_stars_at_ra_dec(df, lat2.degrees, lng2.degrees, time,
+                                        target_ra, target_dec, tolerance_dec, tolerance_ra, magnitude)
 
-if found_stars:
-    hip_to_name = {v: k for k, v in named_star_dict.items()}
+    if found_stars:
+        hip_to_name = {v: k for k, v in named_star_dict.items()}
 
-    print(f"Stars found within {tolerance_degrees} degrees of Azimuth {azimuth_degrees} and Altitude {altitude_degrees} at {now.strftime("%d %B %Y %I:%M%p"):}")
-    for star in sorted(found_stars, key=lambda item: item['magnitude'] ):
-        print(f" (HIP {star['hip']}): Azimuth = {star['azimuth']:.2f}°, Altitude = {star['altitude']:.2f}°, Magnitude = {star['magnitude']} RA: {star['ra']} Dec: {star['dec']} {hip_to_name.get(star['hip'], "-")}")
-else:
-    print(f"No stars found within {tolerance_degrees} degrees of Azimuth {azimuth_degrees} and Altitude {altitude_degrees} at {now.astimezone(zone).strftime("%d %B %Y %I:%M%p"):}.")
+        print(f"Stars found within {tolerance_dec:2f} degrees of Azimuth {azimuth_degrees} and Altitude {altitude_degrees} at {time_format(zone, observation_time)}.")
+        for star in sorted(found_stars, key=lambda item: item['magnitude'] ):
+            print(f" (HIP {star['hip']}): Azimuth = {star['azimuth'].degrees:2f}°, Altitude = {star['altitude'].degrees:.2f}°, Magnitude = {star['magnitude']} RA: {star['ra']:2f} Dec: {star['dec']:2f} {hip_to_name.get(star['hip'], "-")}")
+    else:
+        print(f"No stars found within {tolerance_dec:2f} degrees of Azimuth {azimuth_degrees:2f} and Altitude {altitude_degrees:2f} at {time_format(zone, observation_time)}.")
