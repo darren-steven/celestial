@@ -1,3 +1,5 @@
+from math import atan, degrees
+import math
 from operator import attrgetter
 from pprint import pprint
 from pytz import timezone
@@ -11,6 +13,8 @@ from skyfield.named_stars import named_star_dict
 from skyfield.units import Angle
 import numpy as np
 import pandas as pd
+from astroquery.simbad import Simbad
+from astropy.table import Table
 
 # do some setup of common things, like load the catalog, earth
 
@@ -39,6 +43,43 @@ with load.open(hipparcos.URL) as f:
 planets = load('de421.bsp')
 earth = planets['earth']
 
+def get_hd_number_from_simbad(hip_number):
+    """
+    Looks up the HD catalog number of a star in SIMBAD given its HIP number.
+
+    Args:
+        hip_number (int): The Hipparcos (HIP) number of the star.
+
+    Returns:
+        str or None: The HD catalog number (e.g., "HD 12345") if found, otherwise None.
+    """
+    try:
+        # Configure Simbad to return HD numbers
+        Simbad.add_votable_fields('ids')
+
+        # Query Simbad for the star with the given HIP number
+        result_table = Simbad.query_object(f'HIP{hip_number}')
+
+        if result_table is None or len(result_table) == 0:
+            print(f"No SIMBAD entry found for HIP {hip_number}")
+            return None
+
+        # Extract HD numbers from the result table
+        hd_numbers = []
+        for row in result_table:
+            if 'HD' in row['main_id']:
+                hd_numbers.append(row['main_id'])
+
+        if not hd_numbers:
+            print(f"No HD number found for HIP {hip_number}")
+            return None
+
+        # Return the first HD number found (there might be multiple)
+        return hd_numbers[0]
+
+    except Exception as e:
+        print(f"An error occurred while querying SIMBAD for HIP {hip_number}: {e}")
+        return None
 
 def find_stars_at_altaz(df, latitude, longitude, time, target_azimuth, target_altitude, tolerance_degrees=1.0, magnitude=4.0):
     """
@@ -123,7 +164,6 @@ def find_stars_at_ra_dec(df, latitude, longitude, time, target_ra, target_dec, t
     
     # filter on magnitude
     df = df.loc[(df['magnitude'] <= magnitude)]
-  
     # Create the observer
     observer_location = wgs84.latlon(latitude, longitude)
     observer = earth + observer_location
@@ -143,12 +183,18 @@ def find_stars_at_ra_dec(df, latitude, longitude, time, target_ra, target_dec, t
         alt,az, _ = apparent.altaz()
 
 
-        # TODO - check if star is withing our range of ra and dec (ra +- tolerance, dec +- tolerance)
+        # TODO: We can mass process the entire catalog - might be faster
+        # then iterate teh results
         # Check if the star is within the tolerance
         if (abs(ra.hours - target_ra) <= tolerance_hours and
                 abs(dec.degrees - target_dec) <= tolerance_degrees):
+            
+            # lookup star hip number in SIMBAD
+            hd_number = get_hd_number_from_simbad(hip_number)    
+
             found_stars.append({
                 'hip': hip_number,
+                'hd': hd_number,
                 'azimuth': az,
                 'altitude': alt,
                 'magnitude': row['magnitude'],
@@ -225,6 +271,36 @@ def calculate_distance_and_altaz(lat1, lng1, elevation1, lat2, lng2, elevation2,
 
     return distance_km, azimuth_degrees, altitude_degrees
 
+def haversine_distance(lat1_deg, lon1_deg, lat2_deg, lon2_deg, earth_radius_km=6371.0):
+    """
+    Calculate the great-circle distance between two points
+    on the earth (specified in decimal degrees) using the Haversine formula.
+
+    Args:
+        lat1_deg: Latitude of point 1 in degrees.
+        lon1_deg: Longitude of point 1 in degrees.
+        lat2_deg: Latitude of point 2 in degrees.
+        lon2_deg: Longitude of point 2 in degrees.
+        earth_radius_km: Mean radius of Earth in kilometers. Defaults to 6371.0 km.
+
+    Returns:
+        Distance in kilometers.
+    """
+    # Convert latitude and longitude from degrees to radians
+    lat1_rad = math.radians(lat1_deg)
+    lon1_rad = math.radians(lon1_deg)
+    lat2_rad = math.radians(lat2_deg)
+    lon2_rad = math.radians(lon2_deg)
+
+    # Haversine formula
+    dlon = lon2_rad - lon1_rad
+    dlat = lat2_rad - lat1_rad
+    a = math.sin(dlat / 2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)) # Central angle in radians
+
+    distance = earth_radius_km * c
+    return distance
+
 def time_format(zone, observation_time):
     return observation_time.astimezone(zone).strftime("%d %B %Y %I:%M%p")
 
@@ -238,7 +314,7 @@ if __name__ == "__main__":
     # for a given alt/az, all the stars that pass through will be a fixed declination, with ra varying with time
     # set tight dec tolerance, low RA
     tolerance_dec = 10/60.0
-    tolerance_ra = 10/60.0
+    tolerance_ra = 20/60.0
     magnitude = 10.0
 
     # te 39° 0'0.34"Nst our azimuth calc
@@ -252,24 +328,55 @@ if __name__ == "__main__":
     # Location 2: Pikes peak 38.8409° N, 105.0423° W
     lat2 = Angle(degrees = 38.8409)
     lng2 = Angle(degrees = -105.0423) 
-    elevation2 = 4345.7
+    elevation2 = 4345.0
 
     # Calculate distance and alt/az
     distance_km, azimuth_degrees, altitude_degrees = calculate_distance_and_altaz(
         lat1.degrees, lng1.degrees, elevation1, lat2.degrees, lng2.degrees, elevation2, time
     )
 
+    distance_flat, azimuth_flat, altitude_flat = calculate_distance_and_altaz(
+        lat1.degrees, lng1.degrees, 0, lat2.degrees, lng2.degrees, 0, time
+    )
+
     target_ra, target_dec = altaz_to_radec(altitude_degrees, azimuth_degrees,
                                             lat2.degrees, lng2.degrees, elevation2, time)
+    
+    flat_angle = degrees(atan((elevation2 - elevation1) / (distance_flat * 1000.0)))
+
+    # calculate the surface distance, using haversine
+    distance_arc = haversine_distance(lat1.degrees, lng1.degrees, lat2.degrees, lng2.degrees)
+
+        # 2. Create Skyfield geographic position objects
+    location1 = wgs84.latlon(latitude_degrees=lat1.degrees, longitude_degrees=lng1.degrees, elevation_m=0)
+    location2 = wgs84.latlon(latitude_degrees=lat2.degrees, longitude_degrees=lng2.degrees, elevation_m=0)
+
+    # 4. Get the geocentric position vectors *at that time*
+    #    These are instances of position objects like Geometric, Astrometric etc.
+    pos1 = location1.at(time)
+    pos2 = location2.at(time)
+
+    # 5. Calculate the angular separation *between the position vectors*
+    angle = pos1.separation_from(pos2) # This works!
+
+    # 6. Choose Earth radius (e.g., WGS84 equatorial radius from Skyfield)
+    earth_radius_km = wgs84.radius.km
+    # earth_radius_km = 6371.0 # Or mean radius
+
+    # 7. Calculate the great-circle distance
+    distance_km_skyfield = angle.radians * earth_radius_km
+        
+    
 
     print(f"At {time.utc_strftime('%Y-%m-%d %H:%M:%S UTC')}:")
-    print(f"  Distance between locations: {distance_km:.2f} km")
+    print(f"  Distance between locations los: {distance_km:.2f} km, On base: {distance_flat:.2f} km, hversine: {distance_arc:.2f} km, Skyfiled: {distance_km_skyfield:.2f} km")
     print(f"  Azimuth from location 1 to location 2: {azimuth_degrees:.2f}°")
-    print(f"  Altitude from location 1 to location 2: {altitude_degrees:.2f}°")
+    print(f"  Altitude from location 1 to location 2: {altitude_degrees:.2f}° Flat Angle: {flat_angle:.2f}°")
     print(f"  Target RA of alt/az: {target_ra}, Target Dec; {target_dec}")
     print(f"  Target lat/long: {lat2.degrees}, {lng2.degrees} at {elevation2}")
     print()
 
+    exit()
     # found_stars = find_stars_at_altaz(df, latitude, longitude, time, target_azimuth, target_altitude, tolerance_degrees, magnitude)
     found_stars = find_stars_at_ra_dec(df, lat2.degrees, lng2.degrees, time,
                                         target_ra, target_dec, tolerance_dec, tolerance_ra, magnitude)
@@ -277,8 +384,13 @@ if __name__ == "__main__":
     if found_stars:
         hip_to_name = {v: k for k, v in named_star_dict.items()}
 
+       
+
+
         print(f"Stars found within {tolerance_dec:2f} degrees of Azimuth {azimuth_degrees} and Altitude {altitude_degrees} at {time_format(zone, observation_time)}.")
+
         for star in sorted(found_stars, key=lambda item: item['magnitude'] ):
-            print(f" (HIP {star['hip']}): Azimuth = {star['azimuth'].degrees:2f}°, Altitude = {star['altitude'].degrees:.2f}°, Magnitude = {star['magnitude']} RA: {star['ra']:2f} Dec: {star['dec']:2f} {hip_to_name.get(star['hip'], "-")}")
+             
+            print(f" (HIP {star['hip']}): ({star['hd']}) Azimuth = {star['azimuth'].degrees:2f}°, Altitude = {star['altitude'].degrees:.2f}°, Magnitude = {star['magnitude']} RA: {star['ra']:2f} Dec: {star['dec']:2f} {hip_to_name.get(star['hip'], "-")}")
     else:
         print(f"No stars found within {tolerance_dec:2f} degrees of Azimuth {azimuth_degrees:2f} and Altitude {altitude_degrees:2f} at {time_format(zone, observation_time)}.")
