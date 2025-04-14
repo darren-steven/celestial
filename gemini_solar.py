@@ -22,17 +22,9 @@ except Exception:
     print("Could not load de440.bsp, falling back to de421.bsp")
     eph = load('de421.bsp')
 
-# *** LOAD PLANETARY CONSTANTS KERNEL (PCK) ***
-# Skyfield should download this if not present in the loader's directory
-# pck00011.tpc is a standard, relatively recent text PCK.
-try:
-    load('pck00011.tpc')
-except Exception as e:
-    print(f"ERROR: Could not load PCK file 'pck00011.tpc'. Radii will be unavailable.")
-    print(f"Error details: {e}")
-    # Consider falling back to older PCK like pck00010.tpc or exiting if radii are essential
-    # load('pck00010.tpc') # Example fallback
-    exit() # Exit if PCK loading fails and radii are needed
+SUN_RADIUS_KM_HARDCODED = 695700.0
+MOON_RADIUS_KM_HARDCODED = 1737.4
+EARTH_EQUATORIAL_RADIUS_KM = 6378.137 # WGS84 value
 
 # Define bodies from the ephemeris
 sun = eph['sun']
@@ -43,9 +35,6 @@ earth = eph['earth']
 t_start = ts.utc(2021, 1, 1)
 t_end = ts.utc(2030, 12, 31)
 
-# a fudge to catch eclipses where the cenrel line is offset from the geocentric line
-# we probably should flip the calculation - and look fron the sun perspective
-earth_angle = 0.004
 
 # --- Helper Functions ---
 
@@ -72,16 +61,17 @@ def get_sun_moon_separation_and_radii(t):
         # if sun_dist_km <= 0 or moon_dist_km <= 0:
         #      return None, None, None
 
-        sun_radius_km = 696340.0
-        moon_radius_km = 1737.4
-        # *** END CORRECTION ***
 
-        sun_radius_rad = np.arctan2(sun_radius_km, sun_dist_km)
-        moon_radius_rad = np.arctan2(moon_radius_km, moon_dist_km)
+        sun_radius_rad = np.arctan2(SUN_RADIUS_KM_HARDCODED, sun_dist_km)
+        moon_radius_rad = np.arctan2(MOON_RADIUS_KM_HARDCODED, moon_dist_km)
 
         sun_radius_angle = Angle(radians=sun_radius_rad)
         moon_radius_angle = Angle(radians=moon_radius_rad)
-        return separation, sun_radius_angle, moon_radius_angle
+        # Earth angular radius seen from Moon (related to parallax)
+        earth_radius_at_moon_rad = np.arcsin(EARTH_EQUATORIAL_RADIUS_KM / moon_dist_km)
+        earth_radius_at_moon_angle = Angle(radians=earth_radius_at_moon_rad)
+        
+        return separation, sun_radius_angle, moon_radius_angle, earth_radius_at_moon_angle
 
     except Exception as e:
         print(f"Warning: Could not calculate positions/radii at {t.utc_iso()}: {e}")
@@ -91,10 +81,10 @@ def get_sun_moon_separation_and_radii(t):
 # --- Function for find_discrete: Is eclipse possible? ---
 # (Code remains the same, relies on corrected helper function)
 def eclipse_possible(t):
-    separation, sun_radius, moon_radius = get_sun_moon_separation_and_radii(t)
+    separation, sun_radius, moon_radius, earth_at_moon_radians = get_sun_moon_separation_and_radii(t)
     if separation is None or sun_radius is None or moon_radius is None: # Check radii too
         return False
-    return separation.radians < (sun_radius.radians + moon_radius.radians) + earth_angle
+    return separation.radians < (sun_radius.radians + moon_radius.radians + earth_at_moon_radians.radians)
 
 eclipse_possible.step_days = 0.01
 
@@ -102,7 +92,7 @@ eclipse_possible.step_days = 0.01
 # (Code remains the same, relies on corrected helper function)
 def separation_degrees(t_tdb_jd):
     t = ts.tdb(jd=t_tdb_jd)
-    separation, _, _ = get_sun_moon_separation_and_radii(t)
+    separation, _, _, _= get_sun_moon_separation_and_radii(t)
     if separation is None:
         return 180.0
     return separation.degrees
@@ -170,15 +160,16 @@ try:
 
             print(f"  Minimum separation found: {min_sep_deg:.5f} deg at {t_max_eclipse.utc_iso()}")
 
-            final_sep, final_sun_r, final_moon_r = get_sun_moon_separation_and_radii(t_max_eclipse)
+            final_sep, final_sun_r, final_moon_r, earth_size_radians = get_sun_moon_separation_and_radii(t_max_eclipse)
 
             if final_sep is None or final_sun_r is None or final_moon_r is None:
                 print("  Verification failed (calculation or radius error).")
                 continue
 
-            sum_radii = final_sun_r.radians + final_moon_r.radians
+            sum_radii = final_sun_r.radians + final_moon_r.radians + earth_size_radians.radians
             # Check with a tiny tolerance for floating point math
-            is_eclipse = final_sep.radians < sum_radii + earth_angle
+            is_eclipse = final_sep.radians < sum_radii 
+            
             print(f"  At minimum: Sep={final_sep.degrees:.5f}°, Sun Radius={final_sun_r.degrees:.5f}°, Moon Radius={final_moon_r.degrees:.5f}°, Sum={sum_radii:.5f}°")
 
             if is_eclipse:
